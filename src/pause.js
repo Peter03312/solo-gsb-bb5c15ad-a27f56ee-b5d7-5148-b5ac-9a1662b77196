@@ -9,12 +9,24 @@
  *  - 全部待处理延时取消的 release_at。
  * 后续步骤仍按现有规则在“上一步成功时刻 + 等待时长”后到期。重复暂停/恢复
  * 直接幂等返回，不再次平移时间。
+ *
+ * 崩溃安全（进程中断后重启自动收敛）：暂停/恢复同时改主库注册表与业务库，
+ * 跨库 ATTACH 大事务在 WAL 多库下不具崩溃原子性，因此拆成三个单库步骤，
+ * 中间用主库 yard_ops 意图台账衔接，收敛逻辑见 recovery.js：
+ *   1) 主库写意图（携带发生时刻、操作人；恢复还携带 pausedAt/shiftMs）；
+ *   2) 业务库【单库事务】完成考核有效用时结算/重设、到期时间平移与
+ *      yard_paused/yard_resumed 审计界标（同成同败，界标即收敛判据）；
+ *   3) 主库【单库事务】翻转注册表状态并删除意图。
+ * 任一步骤中断，重启（或同一操作重试时）按业务库界标判定：界标在→只补
+ * 主库翻转；界标不在→业务库变更未发生，按意图重做一次。不会重复平移、
+ * 重复记账或重复写界标。
  */
 
 const {
   getMainDb, withMainDb, yardDbPath, currentYardId,
   dropYardConnection, ORIGINAL_YARD_ID
 } = require('./db');
+const recovery = require('./recovery');
 const { InterlockError } = require('./interlocking');
 
 function rowToPause(row) {
@@ -27,6 +39,7 @@ function rowToPause(row) {
     sourceYardId: row.source_yard_id,
     status: row.status === 'paused' ? 'paused' : 'active',
     paused: row.status === 'paused',
+    broken: row.status === 'broken',
     pausedBy: row.paused_by || null,
     pausedAt: row.paused_at || null,
     resumedBy: row.resumed_by || null,
@@ -62,12 +75,21 @@ function assertActive(yardId) {
   }
 }
 
+/**
+ * 暂停副本。步骤：意图 → 业务库单库事务（考核结算 + 界标）→ 主库翻转。
+ */
 function pauseCurrentYard(yardId, operator) {
   return withMainDb(() => {
     const db = getMainDb();
+    // 上一次暂停/恢复若因进程中断残留，先收敛，再按当前真实状态判定幂等
+    recovery.reconcileYardOps(yardId);
     const row = db.prepare(`SELECT * FROM yards WHERE id=?`).get(yardId);
     if (!row) {
       throw new InterlockError(404, 'YARD_NOT_FOUND', `未知演练副本：该站场不存在`);
+    }
+    if (row.status === 'broken') {
+      throw new InterlockError(503, 'YARD_BROKEN',
+        `该副本业务数据已损坏且无法自动修复，已被隔离、拒绝访问：${row.broken_reason || ''}；其他站场可正常使用`);
     }
     if (row.id === ORIGINAL_YARD_ID || row.kind === 'original') {
       throw new InterlockError(400, 'YARD_ORIGINAL_NOT_PAUSABLE', '原站场不可暂停，只能暂停管理员创建的命名演练副本');
@@ -75,40 +97,42 @@ function pauseCurrentYard(yardId, operator) {
     if (row.status === 'paused') {
       return { yard: rowToPause(row), changed: false, alreadyPaused: true };
     }
+    if (row.status === 'creating') {
+      throw new InterlockError(404, 'YARD_NOT_READY', '该副本尚在创建中，请稍后再暂停');
+    }
 
     const now = Date.now();
-    const alias = 'paused_yard_db';
-    const attach = () => db.prepare(`ATTACH DATABASE ? AS ${alias}`).run(yardDbPath(yardId));
-    const detach = () => { try { db.exec(`DETACH DATABASE ${alias}`); } catch (_) {} };
+    const params = { now, pausedBy: operator, fromStatus: row.status };
 
-    attach();
+    // 步骤 1：登记暂停意图（主库单条事务）
+    recovery.insertOp(yardId, 'pause', operator, params);
+
+    // 步骤 2：业务库单库事务（考核有效用时结算 + yard_paused 界标）
+    let conn;
     try {
-      db.transaction(() => {
-        db.prepare(
-          `UPDATE yards SET status='paused', paused_by=?, paused_at=?, resumed_by=NULL, resumed_at=NULL
-            WHERE id=? AND status='active'`
-        ).run(operator, now, yardId);
-        // 考核有效用时冻结：把本段运行时间计入 used_ms 并清空 live_since。
-        // 与暂停状态同一事务提交，避免暂停/用时状态不一致。
-        db.prepare(
-          `UPDATE ${alias}.exams SET used_ms = used_ms + MAX(0, ? - COALESCE(live_since, ?)),
-                  live_since = NULL
-            WHERE status='in_progress'`
-        ).run(now, now);
-        // 审计：暂停界标写入【该副本业务库】的流水表，与暂停状态同成同败
-        // （yards 行在主库、流水在业务库，跨库 ATTACH 单事务提交）。
-        require('./audit').recordYardPausedInTxn(db, `${alias}.audit_entries`, {
-          yardId,
-          actor: operator,
-          pausedAt: now,
-          before: { status: 'active', paused: false },
-          after: { status: 'paused', paused: true, pausedBy: operator, pausedAt: now }
-        });
-      })();
+      conn = recovery.openAux(yardId);
+      recovery.settlePauseInYardTxn(conn, row, params);
+    } catch (e) {
+      if (recovery.isCorruptionError(e)) recovery.markBroken(yardId, e.message);
+      // 业务库写入失败：意图保留给启动/重试收敛；本次请求报错，主库未翻转，
+      // 对外语义仍是操作前（副本仍 active）。
+      throw new InterlockError(500, 'YARD_PAUSE_FAILED',
+        `暂停写入副本业务库失败（注册表仍为运行中，重启将自动收敛）：${e.message}`);
     } finally {
-      detach();
+      if (conn) { try { conn.close(); } catch (_) {} }
     }
-    // ATTACH 已在业务库写入：丢弃缓存连接，确保后续以暂停语义读取新状态
+
+    // 步骤 3：主库翻转 + 清理意图（单主库事务）。中断在此之后由重启补做本步。
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE yards SET status='paused', paused_by=?, paused_at=?,
+                resumed_by=NULL, resumed_at=NULL
+          WHERE id=? AND status='active'`
+      ).run(operator, now, yardId);
+      recovery.clearOp(yardId, 'pause');
+    })();
+
+    // 业务库已由独立连接写入：丢弃缓存连接，确保随后以暂停语义读取新状态
     dropYardConnection(yardId);
     return {
       yard: rowToPause(db.prepare(`SELECT * FROM yards WHERE id=?`).get(yardId)),
@@ -118,85 +142,76 @@ function pauseCurrentYard(yardId, operator) {
   });
 }
 
+/**
+ * 恢复副本。步骤：意图 → 业务库单库事务（平移 + 考核重设 + 界标）→
+ * 主库翻转。返回后由路由层执行恢复后的封锁/计划/取消/等待复核（全部为
+ * 幂等扫描，重启时调度器也会补做）。
+ */
 function resumeCurrentYard(yardId, operator) {
   return withMainDb(() => {
     const db = getMainDb();
-    const row = db.prepare(`SELECT * FROM yards WHERE id=?`).get(yardId);
-    if (!row) {
+    // 收敛上一次中断残留（可能把状态直接补成 active）
+    recovery.reconcileYardOps(yardId);
+    const row0 = db.prepare(`SELECT * FROM yards WHERE id=?`).get(yardId);
+    if (!row0) {
       throw new InterlockError(404, 'YARD_NOT_FOUND', `未知演练副本：该站场不存在`);
     }
-    if (row.id === ORIGINAL_YARD_ID || row.kind === 'original') {
+    if (row0.status === 'broken') {
+      throw new InterlockError(503, 'YARD_BROKEN',
+        `该副本业务数据已损坏且无法自动修复，已被隔离、拒绝访问：${row0.broken_reason || ''}；其他站场可正常使用`);
+    }
+    if (row0.id === ORIGINAL_YARD_ID || row0.kind === 'original') {
       throw new InterlockError(400, 'YARD_ORIGINAL_NOT_RESUMABLE', '原站场始终运行，无需恢复');
     }
-    if (row.status !== 'paused') {
-      return { yard: rowToPause(row), changed: false, alreadyResumed: true, shiftMs: 0 };
+    if (row0.status !== 'paused') {
+      return { yard: rowToPause(row0), changed: false, alreadyResumed: true, shiftMs: 0 };
     }
 
     const now = Date.now();
-    const shiftMs = Math.max(0, now - Number(row.paused_at || now));
-    const alias = 'paused_yard_db';
-    const attach = () => db.prepare(`ATTACH DATABASE ? AS ${alias}`).run(yardDbPath(yardId));
-    const detach = () => { try { db.exec(`DETACH DATABASE ${alias}`); } catch (_) {} };
+    const shiftMs = Math.max(0, now - Number(row0.paused_at || now));
+    const params = {
+      now,
+      resumedBy: operator,
+      pausedAt: Number(row0.paused_at),
+      pausedBy: row0.paused_by || null,
+      shiftMs
+    };
 
-    attach();
+    // 步骤 1：登记恢复意图
+    recovery.insertOp(yardId, 'resume', operator, params);
+
+    // 步骤 2：业务库单库事务（平移到期时间 + 考核重设 live_since + 界标）
+    let conn;
+    let adjusted = { movementPlanSteps: 0, cancellations: 0 };
     try {
-      const adjusted = db.transaction(() => {
-        // 仅平移活动计划当前已排期的一步；后续步骤 due_at 仍为 NULL，按现有规则计时。
-        const planResult = db.prepare(
-          `UPDATE ${alias}.movement_plan_steps
-              SET due_at = due_at + @shiftMs
-            WHERE status='pending'
-              AND due_at IS NOT NULL
-              AND due_at > @pausedAt
-              AND plan_id IN (SELECT id FROM ${alias}.movement_plans WHERE status='active')`
-        ).run({ shiftMs, pausedAt: Number(row.paused_at) });
-        const cancelResult = db.prepare(
-          `UPDATE ${alias}.cancellation_applications
-              SET release_at = release_at + @shiftMs
-            WHERE status='pending' AND release_at > @pausedAt`
-        ).run({ shiftMs, pausedAt: Number(row.paused_at) });
-        // 考核恢复计时：从恢复时刻起算新的运行段（暂停段已在 pause 时计入 used_ms）
-        db.prepare(
-          `UPDATE ${alias}.exams SET live_since = @now
-            WHERE status='in_progress' AND live_since IS NULL`
-        ).run({ now });
-        db.prepare(
-          `UPDATE yards SET status='active', resumed_by=?, resumed_at=?,
-                  paused_by=NULL, paused_at=NULL
-            WHERE id=? AND status='paused'`
-        ).run(operator, now, yardId);
-        // 审计：恢复界标（含平移时长与受影响条目数）写入副本业务库流水表，
-        // 与恢复状态/时间平移同一事务提交。
-        require('./audit').recordYardResumedInTxn(db, `${alias}.audit_entries`, {
-          yardId,
-          actor: operator,
-          resumedAt: now,
-          shiftMs,
-          adjusted: {
-            movementPlanSteps: planResult.changes,
-            cancellations: cancelResult.changes
-          },
-          before: {
-            status: 'paused', paused: true,
-            pausedBy: row.paused_by || null, pausedAt: Number(row.paused_at)
-          },
-          after: { status: 'active', paused: false, resumedBy: operator, resumedAt: now }
-        });
-        return { movementPlanSteps: planResult.changes, cancellations: cancelResult.changes };
-      })();
-      return {
-        yard: rowToPause(db.prepare(`SELECT * FROM yards WHERE id=?`).get(yardId)),
-        changed: true,
-        alreadyResumed: false,
-        shiftMs,
-        adjusted
-      };
+      conn = recovery.openAux(yardId);
+      adjusted = recovery.settleResumeInYardTxn(conn, row0, params);
+    } catch (e) {
+      if (recovery.isCorruptionError(e)) recovery.markBroken(yardId, e.message);
+      throw new InterlockError(500, 'YARD_RESUME_FAILED',
+        `恢复写入副本业务库失败（注册表仍为暂停中，重启将自动收敛）：${e.message}`);
     } finally {
-      detach();
+      if (conn) { try { conn.close(); } catch (_) {} }
     }
-    // 主库连接通过 ATTACH 更新业务库后，丢弃该业务库此前缓存的连接，确保随后
-    // 恢复复核读取到同一事务已提交的 due_at/release_at，而不是旧 WAL 快照。
+
+    // 步骤 3：主库翻转 + 清理意图
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE yards SET status='active', resumed_by=?, resumed_at=?,
+                paused_by=NULL, paused_at=NULL
+          WHERE id=? AND status='paused'`
+      ).run(operator, now, yardId);
+      recovery.clearOp(yardId, 'resume');
+    })();
+
     dropYardConnection(yardId);
+    return {
+      yard: rowToPause(db.prepare(`SELECT * FROM yards WHERE id=?`).get(yardId)),
+      changed: true,
+      alreadyResumed: false,
+      shiftMs,
+      adjusted
+    };
   });
 }
 

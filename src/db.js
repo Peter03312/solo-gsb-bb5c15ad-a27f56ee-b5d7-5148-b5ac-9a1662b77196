@@ -78,11 +78,15 @@ function getMainDb() {
     mainDb.exec(`ALTER TABLE sessions ADD COLUMN current_yard_id INTEGER`);
   }
   migrateYardsPauseColumns(mainDb);
+  // 故障收敛台账（旧库升级时补建；CREATE TABLE IF NOT EXISTS 对新库幂等）
+  mainDb.exec(readSql('schema-registry.sql'));
 
   return mainDb;
 }
-
-/** 旧库升级：站场注册增加暂停列，并把 status CHECK 扩展为 active/paused。 */
+/**
+ * 旧库升级：站场注册增加暂停列与损坏隔离列，并把 status CHECK 扩展为
+ * active/paused/creating/broken。
+ */
 function migrateYardsPauseColumns(db) {
   const cols = db.prepare(`PRAGMA table_info(yards)`).all();
   const addColumn = (name, ddl) => {
@@ -92,9 +96,11 @@ function migrateYardsPauseColumns(db) {
   addColumn('paused_at', 'paused_at INTEGER');
   addColumn('resumed_by', 'resumed_by TEXT');
   addColumn('resumed_at', 'resumed_at INTEGER');
+  addColumn('broken_reason', 'broken_reason TEXT');
+  addColumn('broken_at', 'broken_at INTEGER');
 
   const ddl = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='yards'`).get().sql;
-  if (ddl.includes("'paused'")) return;
+  if (ddl.includes("'creating'")) return;
 
   const previousForeignKeys = db.pragma('foreign_keys', { simple: true });
   db.pragma('foreign_keys = OFF');
@@ -109,19 +115,23 @@ function migrateYardsPauseColumns(db) {
                      CHECK (kind IN ('original','copy')),
           source_yard_id INTEGER REFERENCES yards(id),
           status     TEXT NOT NULL DEFAULT 'active'
-                     CHECK (status IN ('active','paused')),
+                     CHECK (status IN ('active','paused','creating','broken')),
           db_file    TEXT NOT NULL,
           created_by TEXT,
           paused_by TEXT,
           paused_at INTEGER,
           resumed_by TEXT,
           resumed_at INTEGER,
+          broken_reason TEXT,
+          broken_at INTEGER,
           created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         INSERT INTO yards_new(id,name,kind,source_yard_id,status,db_file,created_by,
-                              paused_by,paused_at,resumed_by,resumed_at,created_at)
+                              paused_by,paused_at,resumed_by,resumed_at,
+                              broken_reason,broken_at,created_at)
         SELECT id,name,kind,source_yard_id,status,db_file,created_by,
-               paused_by,paused_at,resumed_by,resumed_at,created_at FROM yards;
+               paused_by,paused_at,resumed_by,resumed_at,
+               NULL,NULL,created_at FROM yards;
         DROP TABLE yards;
         ALTER TABLE yards_new RENAME TO yards;
       `);
@@ -143,11 +153,20 @@ function openYardConnection(yardId) {
     err.code = 'YARD_DB_MISSING';
     throw err;
   }
-  const conn = new Database(file);
+  let conn;
+  try {
+    conn = new Database(file);
+  } catch (e) {
+    const err = new Error(`站场 ${yardId} 的业务数据库无法打开：${e.message}`);
+    err.status = 503;
+    err.code = 'YARD_DB_CORRUPT';
+    throw err;
+  }
   conn.pragma('journal_mode = WAL');
   conn.pragma('foreign_keys = ON');
   conn.pragma('busy_timeout = 5000');
-  // 防御性补建（文件由初始化/复制流程建好，正常情况下全部表已存在）
+  // 防御性补建（文件由初始化/复制流程建好，正常情况下全部表已存在）。
+  // 注意：损坏库上 exec 会抛错，由调用方（鉴权层/调度器）隔离为 broken。
   conn.exec(readSql('schema-yard.sql'));
   return conn;
 }

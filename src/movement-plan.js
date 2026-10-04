@@ -433,11 +433,13 @@ function processDueAllYards(trigger) {
   if (!yardsList) return processDue(trigger); // yards 注册表不可用（脚本直调）
   const summary = [];
   for (const y of yardsList) {
+    if (y.broken) continue;                    // 损坏隔离副本不参与任何扫描
     if (require('./pause').isPaused(y.id)) continue;
     try {
       const r = withYard(y.id, () => processDue(`${trigger}:yard${y.id}`));
       summary.push({ yard: y.id, ...r });
     } catch (e) {
+      if (require('./recovery').quarantineIfCorrupt(y.id, e)) continue;
       console.error(`[movement-plan] 站场 ${y.id} 定时扫描失败:`, e);
     }
   }

@@ -21,9 +21,10 @@
  *    挂接目标（recordWalkthroughReleaseInTxn）；幂等重传在走行校验处提前返回，
  *    不会重复计数。人工释放、延时取消到期解除不调用本钩子，不算完成；定时走行
  *    计划注入的走行事件走同一末段清空路径，同样计入。
- *  - 副本暂停期间冻结有效用时：pause 在主库 ATTACH 事务内把
- *    used_ms += now-live_since 并清空 live_since；resume 重设 live_since；
- *    交卷/终止时结算。暂停状态跨重启持久化，冻结随之持续。
+ *  - 副本暂停期间冻结有效用时：pause 业务库单库事务内把
+ *    used_ms += now-live_since 并清空 live_since（与 yard_paused 界标同成同败，
+ *    主库注册表翻转由下一步单库事务完成；中断收敛见 recovery.js）；resume 重设
+ *    live_since；交卷/终止时结算。暂停状态跨重启持久化，冻结随之持续。
  *  - 检查点回退或站场重置：进行中的考核置 terminated 并记录原因，已交卷成绩
  *    （submitted）保留。考核表不参与检查点快照替换、创建副本时也不复制。
  */
@@ -247,11 +248,11 @@ function submitExam(examId, studentName) {
   const now = Date.now();
   db.transaction(() => {
     db.prepare(
-      `UPDATE exams SET status='submitted', submitted_at=?,
-              used_ms=used_ms + MAX(0, ? - COALESCE(live_since, ?)),
+      `UPDATE exams SET status='submitted', submitted_at=@now,
+              used_ms=used_ms + MAX(0, @now - COALESCE(live_since, @now)),
               live_since=NULL
-        WHERE id=? AND status='in_progress'`
-    ).run(now, now, now, id);
+        WHERE id=@id AND status='in_progress'`
+    ).run({ now, id });
   })();
   return getExam(id);
 }

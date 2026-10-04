@@ -5,6 +5,7 @@ const express = require('express');
 
 const { getMainDb, withYard } = require('./db');
 const yards = require('./yards');
+const recovery = require('./recovery');
 const { seedDemo } = require('./seed');
 const authRoutes = require('./routes/auth');
 const adminRoutes = require('./routes/admin');
@@ -22,11 +23,28 @@ const PORT = Number(process.env.PORT || 3000);
 // 打开主库（yards 注册表 + sessions；旧版业务库在 ensureRegistry 时迁移）
 getMainDb();
 const original = yards.ensureRegistry();
-console.log(`[startup] 当前站场注册：${yards.listYards()
-  .map((y) => `#${y.id} ${y.name}${y.isOriginal ? '（原站场）' : ''}`).join('；')}`);
 
-// 原站场首次且库为空时写入示例数据（SEED_DEMO=0 可关闭）
+// 进程中断后的故障收敛：创建中断的副本回滚到操作前或激活为操作后完整状态；
+// 暂停/恢复中断按业务库审计界标补齐（不重复平移、记账或写界标）；
+// 业务库损坏的站场标记 broken 隔离——该副本拒绝访问并说明原因，其他站场照常。
+const registeredYards = recovery.reconcileOnStartup();
+const brokenYards = registeredYards.filter((y) => y.status === 'broken');
+console.log(`[startup] 当前站场注册：${yards.listYards()
+  .map((y) => `#${y.id} ${y.name}${y.isOriginal ? '（原站场）' : ''}` +
+    (y.status === 'broken' ? '【已损坏隔离】' : y.status === 'paused' ? '（已暂停）' : ''))
+  .join('；')}`);
+if (brokenYards.length) {
+  console.warn(`[startup] ${brokenYards.length} 个站场业务库损坏已隔离（不影响其他站场）：` +
+    brokenYards.map((y) => `#${y.id} ${y.name}（${y.broken_reason || '未知原因'}）`).join('；'));
+}
+
+// 原站场首次且库为空时写入示例数据（SEED_DEMO=0 可关闭）；原站场损坏则跳过
 withYard(original.id, () => {
+  const row = yards.yardRow(original.id);
+  if (row && row.status === 'broken') {
+    console.error('[startup] 原站场业务库损坏，跳过示例数据初始化');
+    return;
+  }
   if (process.env.SEED_DEMO !== '0') {
     const seeded = seedDemo(require('./db').getYardConnection(original.id));
     if (seeded) console.log('[startup] 已初始化示例站场（R1/R2/R3）');
@@ -35,7 +53,9 @@ withYard(original.id, () => {
 
 // 服务重启后按各站场分别复核：待生效封锁转已生效、等待申请自动兑现、
 // 延时取消按原 release_at 复核（副本不重新计时、不重复兑现）。
+// 创建中断后被激活的副本也在此列（等价于其"首次复核"）；broken 站场跳过。
 for (const y of yards.listYards()) {
+  if (y.broken) continue;
   if (pause.isPaused(y.id)) continue;
   withYard(y.id, () => {
     try {
@@ -45,6 +65,7 @@ for (const y of yards.listYards()) {
       }
     } catch (e) {
       console.error(`[startup] 站场 ${y.id} 封锁状态复核失败:`, e);
+      quarantineIfCorrupt(y.id, e);
     }
     try {
       const r = waiting.sweepFulfillments('server_start');
@@ -53,8 +74,17 @@ for (const y of yards.listYards()) {
       }
     } catch (e) {
       console.error(`[startup] 站场 ${y.id} 等待申请兑现扫描失败:`, e);
+      quarantineIfCorrupt(y.id, e);
     }
   });
+}
+
+/**
+ * 扫描/复核过程中若判定为业务库损坏（文件丢失、无法打开、完整性失败等），
+ * 隔离该站场：标记 broken，后续请求得到 503 YARD_BROKEN；其他站场不受影响。
+ */
+function quarantineIfCorrupt(yardId, e) {
+  return recovery.quarantineIfCorrupt(yardId, e);
 }
 
 // 启动定时走行计划处理：立即扫描一次（重启后继续未完成计划，逾期步骤依序处理；
@@ -94,6 +124,10 @@ app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
   res.status(500).json({ ok: false, error: '服务器内部错误' });
 });
 
-app.listen(PORT, () => {
+const httpServer = app.listen(PORT, () => {
   console.log(`[startup] 进路联锁推演台已启动: http://localhost:${PORT}/`);
+});
+httpServer.on('error', (e) => {
+  console.error('[startup] HTTP 服务监听失败:', e);
+  process.exit(1);
 });

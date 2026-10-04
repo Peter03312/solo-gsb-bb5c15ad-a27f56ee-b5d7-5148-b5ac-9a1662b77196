@@ -12,6 +12,22 @@ CREATE TABLE IF NOT EXISTS meta (
   value TEXT NOT NULL
 );
 
+-- 副本创建清单（故障收敛用）：
+--  - 仅命名演练副本拥有唯一一行（yard_id=1 的原站场无此表行）；
+--  - 与复制数据在【同一个业务库事务】内写入：进程在复制中途中断时，
+--    临时库要么不存在、要么没有完整清单——启动收敛据此判定"复制未完成"，
+--    删除注册行与残留文件，回到操作前；
+--  - 清单记录复制时的源站场、创建人/时刻与各类复制行数，也用于启动时
+--    校验副本业务库的完整性（与注册表不符则隔离为 broken）。
+CREATE TABLE IF NOT EXISTS yard_copy_manifest (
+  yard_id     INTEGER PRIMARY KEY,   -- 恒为本副本编号（注册表 yards.id）
+  source_yard_id INTEGER NOT NULL,
+  name        TEXT NOT NULL,
+  created_by  TEXT,
+  created_at  INTEGER NOT NULL,      -- 创建时刻（epoch 毫秒）
+  copied_json TEXT NOT NULL DEFAULT '{}'
+);
+
 -- 轨道区段
 CREATE TABLE IF NOT EXISTS sections (
   id     TEXT PRIMARY KEY,            -- 区段编号，如 1、3DG

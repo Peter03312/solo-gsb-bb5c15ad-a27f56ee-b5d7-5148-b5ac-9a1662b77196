@@ -765,9 +765,10 @@ function currentYardInfo() {
     if (!y) return null;
     return {
       id: y.id, name: y.name, isOriginal: y.isOriginal, kind: y.kind,
-      status: y.status, paused: y.paused,
+      status: y.status, paused: y.paused, broken: !!y.broken,
       pausedBy: y.pausedBy, pausedAt: y.pausedAt,
-      resumedBy: y.resumedBy, resumedAt: y.resumedAt
+      resumedBy: y.resumedBy, resumedAt: y.resumedAt,
+      brokenReason: y.brokenReason || null
     };
   } catch (_) {
     // yards 表不可用等极端场景不阻塞状态读取

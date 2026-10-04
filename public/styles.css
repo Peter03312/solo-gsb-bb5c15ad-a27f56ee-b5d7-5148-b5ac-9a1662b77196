@@ -73,6 +73,7 @@ header.topbar button:hover { background: rgba(255, 255, 255, .28); }
   white-space: nowrap;
 }
 .yard-bar .yard-badge.paused { background: #7d2828; color: #fff; }
+.yard-bar .yard-badge.broken { background: #3a3a3a; color: #ffb4b4; border: 1px solid #a33; }
 .yard-bar .pause-info { color: #ffe8a3; white-space: nowrap; font-size: 12px; }
 .yard-bar button.small { padding: 3px 10px; font-size: 12px; white-space: nowrap; }
 

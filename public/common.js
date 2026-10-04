@@ -128,7 +128,8 @@ const App = (() => {
     host.appendChild(label);
     const sel = html('select', { class: 'yard-select', title: '选择当前站场（原站场或命名演练副本）' });
     for (const y of yards) {
-      const text = y.isOriginal ? '① 原站场' : `${y.paused ? '⏸' : '🧪'} ${y.name}`;
+      const text = y.isOriginal ? '① 原站场'
+        : `${y.broken ? '⛔' : y.paused ? '⏸' : '🧪'} ${y.name}${y.broken ? '（损坏已隔离）' : ''}`;
       const o = html('option', { value: String(y.id) }, text);
       if (y.id === yardId()) o.selected = true;
       sel.appendChild(o);
@@ -142,12 +143,14 @@ const App = (() => {
     const cur = yards.find((y) => y.id === yardId());
     if (cur && !cur.isOriginal) {
       host.appendChild(html('span', {
-        class: `yard-badge ${cur.paused ? 'paused' : ''}`,
-        title: cur.paused
-          ? `暂停人：${cur.pausedBy || '未知'}；暂停时间：${formatTime(cur.pausedAt)}`
-          : '命名演练副本'
-      }, cur.paused ? '已暂停' : '演练副本'));
-      if (role() === 'admin') {
+        class: `yard-badge ${cur.paused ? 'paused' : ''} ${cur.broken ? 'broken' : ''}`,
+        title: cur.broken
+          ? `副本业务数据已损坏且无法自动修复，已隔离拒绝访问：${cur.brokenReason || '未知原因'}；其他站场可正常使用`
+          : cur.paused
+            ? `暂停人：${cur.pausedBy || '未知'}；暂停时间：${formatTime(cur.pausedAt)}`
+            : '命名演练副本'
+      }, cur.broken ? '已损坏隔离' : cur.paused ? '已暂停' : '演练副本'));
+      if (role() === 'admin' && !cur.broken) {
         const btn = html('button', { class: 'ghost small', style: 'margin-left:6px;' },
           cur.paused ? '恢复演练' : '暂停演练');
         btn.addEventListener('click', () => togglePause(cur, btn));

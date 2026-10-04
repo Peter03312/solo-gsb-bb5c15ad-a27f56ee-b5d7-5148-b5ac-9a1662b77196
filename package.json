@@ -13,13 +13,14 @@
     "test:blockade": "node test/blockade-http.cjs",
     "test:handover": "node test/handover-http.cjs",
     "test:yards": "node test/yards-http.cjs",
+    "test:recovery": "node test/recovery-http.cjs",
     "test:plans": "node test/movement-plan-http.cjs",
     "test:pause": "node test/pause-http.cjs",
     "test:checkpoint": "node test/checkpoint-http.cjs",
     "test:changeset": "node test/route-changeset-http.cjs",
     "test:exam": "node test/exam-http.cjs",
     "test:audit": "node test/audit-http.cjs",
-    "test": "npm run smoke && npm run test:waiting && npm run test:cancel && npm run test:blockade && npm run test:handover && npm run test:yards && npm run test:plans && npm run test:pause && npm run test:checkpoint && npm run test:changeset && npm run test:exam && npm run test:audit"
+    "test": "npm run smoke && npm run test:waiting && npm run test:cancel && npm run test:blockade && npm run test:handover && npm run test:yards && npm run test:recovery && npm run test:plans && npm run test:pause && npm run test:checkpoint && npm run test:changeset && npm run test:exam && npm run test:audit"
   },
   "engines": {
     "node": ">=18"

@@ -79,6 +79,7 @@ router.post('/logout', (req, res) => {
   // 单个站场失败不影响退出）。每个站场分别扫描兑现，互不串用。
   if (session && session.role === 'dispatcher') {
     for (const y of yards.listYards()) {
+      if (y.broken) continue; // 损坏隔离副本跳过（其等待申请随库保留，不影响退出）
       try {
         withYard(y.id, () => waiting.cancelByApplicant(
           session.name, '申请人退出登录，等待申请撤销',

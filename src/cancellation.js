@@ -328,12 +328,14 @@ function processDueAllYards(trigger) {
   const released = [];
   const aborted = [];
   for (const y of yardsList) {
+    if (y.broken) continue;                    // 损坏隔离副本不参与任何扫描
     if (require('./pause').isPaused(y.id)) continue;
     try {
       const r = withYard(y.id, () => processDue(trigger + `:yard${y.id}`));
       for (const id of r.released) released.push({ yard: y.id, id });
       for (const id of r.aborted) aborted.push({ yard: y.id, id });
     } catch (e) {
+      if (require('./recovery').quarantineIfCorrupt(y.id, e)) continue;
       console.error(`[cancel] 站场 ${y.id} 定时扫描失败:`, e);
     }
   }

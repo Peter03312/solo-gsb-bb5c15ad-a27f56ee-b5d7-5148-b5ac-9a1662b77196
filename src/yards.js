@@ -6,9 +6,24 @@
  * 存储模型见 db.js：主库保存 yards 注册表与 sessions；每个站场（原站场 +
  * 各命名副本）各自拥有一份业务库文件，结构为 schema-yard.sql。
  *
- * 管理员可从【原站场】创建命名演练副本，复制在主库的单个事务内完成
- * （ATTACH 源业务库与目标业务库，INSERT ... SELECT 落库后写注册表），
- * 事务提交前任何失败都整体回滚——不会留下"建了一半"的副本。
+ * 管理员可从【原站场】创建命名演练副本。为保证"进程中断后重启自动收敛到
+ * 操作前或操作后的完整状态"，创建流程不再依赖跨多个 WAL 库的 ATTACH 大事务，
+ * 而是拆成各自原子的单库步骤，并由 recovery 模块在启动/重试时收敛：
+ *
+ *   1. 主库事务：同名校验后写注册行 status='creating' + yard_ops 意图
+ *      （此时即占用编号与名称；编号因 AUTOINCREMENT 不回收复用）；
+ *   2. 临时业务库 yard-<id>.copying.tmp 内【单库事务】完成全部复制：
+ *      定义/状态/开放实例与锁和事件/等待/延时取消/封锁/meta/自增序列，
+ *      以及 yard_created 审计界标与 yard_copy_manifest 复制清单；
+ *   3. 临时文件原子改名为正式业务库文件；
+ *   4. 主库事务：注册行翻转为 active、删除意图行；
+ *   5. 按"服务重启后复核"的同一套流程做新副本首次复核（幂等，可在启动时
+ *      由调度器补做，因此中断在 5 不影响一致性）。
+ *
+ * 中断恢复（recovery.reconcileOnStartup / reconcileCreatingYard）：
+ *  - 中断在 1~3（无正式文件或临时文件无完整清单）：删除注册行与残留文件，
+ *    回到操作前，释放同名，不会留下"已注册却打不开/只复制部分数据"的副本；
+ *  - 中断在 4（正式文件完整、清单在）：注册行翻转 active，收敛到操作后。
  *
  * 复制范围（需求逐项对应）：
  *  - 站场定义：sections / switches / signals / routes / route_steps /
@@ -29,11 +44,13 @@
 
 const path = require('path');
 const fs = require('fs');
+const Database = require('better-sqlite3');
 const {
   ORIGINAL_YARD_ID, ORIGINAL_YARD_NAME,
-  getMainDb, getYardConnection, dropYardConnection,
+  getMainDb, dropYardConnection,
   withYard, withMainDb, yardsDir, yardDbFile, yardDbPath, readSql
 } = require('./db');
+const recovery = require('./recovery');
 
 const NAME_RE = /^\S(?:.*\S)?$/;
 const MAX_NAME_LEN = 30;
@@ -67,10 +84,16 @@ function listYards() {
     .prepare(`SELECT id, name, kind, source_yard_id AS sourceYardId, status,
                      created_by AS createdBy, paused_by AS pausedBy,
                      paused_at AS pausedAt, resumed_by AS resumedBy,
-                     resumed_at AS resumedAt, created_at AS createdAt
+                     resumed_at AS resumedAt, broken_reason AS brokenReason,
+                     broken_at AS brokenAt, created_at AS createdAt
                 FROM yards ORDER BY id`)
     .all()
-    .map((y) => ({ ...y, isOriginal: y.id === ORIGINAL_YARD_ID, paused: y.status === 'paused' }));
+    .map((y) => ({
+      ...y,
+      isOriginal: y.id === ORIGINAL_YARD_ID,
+      paused: y.status === 'paused',
+      broken: y.status === 'broken'
+    }));
 }
 
 /**
@@ -79,6 +102,9 @@ function listYards() {
  *  - 旧版主库（业务数据直接在主库）：在主库事务内把全部业务表整体复制到
  *    yard-1.db（含历史交接单），主库业务表原样保留（不再被业务路径读写）。
  *  - yards 已注册：幂等返回。
+ * 注：启动故障收敛（recovery.reconcileOnStartup）在本函数【之后】执行；
+ * 原站场文件缺失的恢复路径（注册存在、文件缺失）由其标记 broken 或
+ * 重新建空库（全新环境首启时 targetPath 尚不存在，见下）。
  */
 function ensureRegistry() {
   const db = getMainDb();
@@ -148,14 +174,14 @@ function copyLegacyDataInTxn(db, dstAlias) {
   }
 }
 
-/** 创建一个仅含业务表结构的空业务库文件（临时文件路径，由调用方改名/注册） */
+/** 创建一个仅含业务表结构的空业务库文件（DELETE 日志模式收尾，保证可安全改名） */
 function initBlankYardFile(filePath) {
-  const conn = new (require('better-sqlite3'))(filePath);
+  const conn = new Database(filePath);
   try {
     conn.pragma('journal_mode = WAL');
     conn.pragma('foreign_keys = ON');
     conn.exec(readSql('schema-yard.sql'));
-    // 立即把 WAL 落回主文件并以 DELETE 模式收尾，保证随后可安全改名
+    // 立即把 WAL 落回主文件并以 DELETE 模式收尾，保证随后可安全改名/单独复制
     conn.pragma('journal_mode = DELETE');
   } finally {
     conn.close();
@@ -196,26 +222,33 @@ function createCopyFromOriginal(rawName, createdBy) {
     err.code = 'YARD_NAME_RESERVED';
     throw err;
   }
-  // 注册表读写、ATTACH 复制事务都在主库连接上完成；必须脱离调用方请求的
-  // 站场上下文（否则事务体内 getDb() 会被 ALS 误路由到站场业务库）。
-  return withMainDb(() => createCopyInMainTxn(name, createdBy));
+  // 注册表读写与复制流程都在主库无站场上下文中完成（避免事务体内 getDb()
+  // 被 ALS 误路由）。
+  return withMainDb(() => createCopyFlow(name, createdBy));
 }
 
-function createCopyInMainTxn(name, createdBy) {
+function createCopyFlow(name, createdBy) {
   const db = getMainDb();
   if (yardByName(name)) {
-    const err = new Error(`已存在名为"${name}"的站场/副本，同名拒绝，请更换名称`);
-    err.status = 409;
-    err.code = 'YARD_NAME_DUPLICATE';
-    throw err;
+    throw duplicateName(name);
   }
 
   const dir = yardsDir();
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-  // 预取下一个副本编号（仅读 sqlite_sequence / 表计数，未落库任何 yards 行）
-  const seqRow = db.prepare(`SELECT seq FROM sqlite_sequence WHERE name='yards'`).get();
-  const newId = (seqRow && Number.isInteger(seqRow.seq) ? seqRow.seq : ORIGINAL_YARD_ID) + 1;
+  // 步骤 1：注册行先以 creating 落库（占用编号与同名），并登记创建意图。
+  // 复制/改名期间进程中断时，启动收敛据此回滚（删行+删残留文件）或激活。
+  const newId = db.transaction(() => {
+    const info = db.prepare(
+      `INSERT INTO yards(name,kind,source_yard_id,status,db_file,created_by)
+       VALUES(?, 'copy', ?, 'creating', ?, ?)`
+    ).run(name, ORIGINAL_YARD_ID, '__pending__', createdBy);
+    const id = Number(info.lastInsertRowid);
+    db.prepare(`UPDATE yards SET db_file=? WHERE id=?`).run(yardDbFile(id), id);
+    recovery.insertOp(id, 'create_copy', createdBy, { name });
+    return id;
+  })();
+
   const finalFile = yardDbFile(newId);
   const finalPath = yardDbPath(newId);
   const tmpPath = path.join(dir, `yard-${newId}.copying.tmp`);
@@ -223,6 +256,8 @@ function createCopyInMainTxn(name, createdBy) {
     try { fs.unlinkSync(p); } catch (_) {}
   }
   if (fs.existsSync(finalPath)) {
+    // 极端竞态（同编号正式文件已存在）：回滚注册后按"文件已存在"拒绝
+    abortCreating(newId);
     const err = new Error(`站场业务库文件 ${finalFile} 已存在，拒绝覆盖`);
     err.status = 409;
     err.code = 'YARD_DB_EXISTS';
@@ -230,69 +265,73 @@ function createCopyInMainTxn(name, createdBy) {
   }
 
   let detail = null;
-  const srcAlias = `src_y${newId}`;
-  const dstAlias = `dst_y${newId}`;
-  const detachQuiet = () => {
-    try { db.exec(`DETACH DATABASE ${dstAlias}`); } catch (_) {}
-    try { db.exec(`DETACH DATABASE ${srcAlias}`); } catch (_) {}
-  };
+  let tmpConn = null;
   try {
-    // 1) 临时文件中建好业务表结构
+    // 步骤 2：临时库中【单库事务】完成全部复制（含清单与创建界标）。
     initBlankYardFile(tmpPath);
-    // 2) 挂载原站场库与临时库（在主库长连接上、事务外完成）
-    db.prepare(`ATTACH DATABASE ? AS ${srcAlias}`).run(yardDbPath(ORIGINAL_YARD_ID));
-    db.prepare(`ATTACH DATABASE ? AS ${dstAlias}`).run(tmpPath);
-    // 3) 单个主库事务内：INSERT ... SELECT 复制全部要求的数据 + 写 yards
-    //    注册行。任何失败整体回滚，不留"复制了一半"的副本。
-    detail = db.transaction(() => {
-      const d = copyOriginalData(db, srcAlias, dstAlias);
-      db.prepare(
-        `INSERT INTO yards(id,name,kind,source_yard_id,status,db_file,created_by)
-         VALUES(?,?, 'copy', ?, 'active', ?, ?)`
-      ).run(newId, name, ORIGINAL_YARD_ID, finalFile, createdBy);
-      // 副本创建界标：复制白名单不含 audit_entries，副本流水表为空，
-      // 本条成为副本审计流水 seq=1——之后只记录该副本自身的新变化，
-      // 不为复制来的旧数据补造历史。与复制/注册同一跨库事务，同成同败。
-      require('./audit').recordYardCreatedInTxn(db, `${dstAlias}.audit_entries`, {
-        yardId: newId,
-        name,
-        actor: createdBy,
-        sourceYardId: ORIGINAL_YARD_ID,
-        copied: d.copied
-      });
-      return d;
-    })();
-    detachQuiet();
-    // 4) 事务已提交（副本此刻起可见）。同一同步代码块内立即：
-    //    关闭该编号可能缓存的连接（此刻不存在，防御）→ 临时文件原子改名落位。
-    //    Node 单线程 + better-sqlite3 同步语义保证其间不会插入其它请求处理。
-    dropYardConnection(newId);
+    tmpConn = new Database(tmpPath);
+    tmpConn.pragma('foreign_keys = ON');
+    // 源业务库以只读方式 ATTACH 到临时库连接：复制事务只写临时库这一个文件，
+    // 其回滚日志保证中断时临时库整体回到"空库"（无清单=未完成），源库只读
+    // 不受影响。
+    tmpConn.prepare(`ATTACH DATABASE ? AS src`).run(yardDbPath(ORIGINAL_YARD_ID));
+    try {
+      detail = tmpConn.transaction(() => {
+        const d = copyOriginalData(tmpConn, 'src', 'main', {
+          yardId: newId, name, createdBy
+        });
+        writeCopyManifest(tmpConn, 'main', {
+          yardId: newId, name, createdBy, copied: d.copied
+        });
+        return d;
+      })();
+    } finally {
+      try { tmpConn.exec(`DETACH DATABASE src`); } catch (_) {}
+    }
+    // 复制事务已提交：把 WAL 落回主文件、切回 DELETE 模式后关闭，
+    // 保证随后改名的是自洽的单一文件（无 -wal 残留）。
+    tmpConn.pragma('journal_mode = DELETE');
+    tmpConn.close();
+    tmpConn = null;
+    cleanupSidecars(tmpPath);
+
+    // 步骤 3：临时文件原子改名落位
     fs.renameSync(tmpPath, finalPath);
     cleanupSidecars(tmpPath);
+
+    // 步骤 4：注册行翻转 active 并清理意图（单主库事务）。中断在本步骤之后、
+    // 进程重启时由 reconcileCreatingYard 凭正式文件+清单补做本翻转。
+    db.transaction(() => {
+      db.prepare(`UPDATE yards SET status='active' WHERE id=? AND status='creating'`)
+        .run(newId);
+      recovery.clearOp(newId, 'create_copy');
+    })();
   } catch (e) {
-    detachQuiet();
+    if (tmpConn) { try { tmpConn.close(); } catch (_) {} }
+    abortCreating(newId);
     for (const p of [tmpPath, tmpPath + '-wal', tmpPath + '-shm']) {
       try { fs.unlinkSync(p); } catch (_) {}
     }
-    // 唯一约束冲突（与并发创建同名）按同名拒绝返回
     if (String(e.code) === 'SQLITE_CONSTRAINT_UNIQUE' ||
         String(e.code) === 'SQLITE_CONSTRAINT_PRIMARYKEY') {
-      if (yardByName(name)) {
-        const dup = new Error(`已存在名为"${name}"的站场/副本，同名拒绝，请更换名称`);
-        dup.status = 409;
-        dup.code = 'YARD_NAME_DUPLICATE';
-        throw dup;
-      }
+      if (yardByName(name)) throw duplicateName(name);
     }
     throw e;
   }
 
   const yard = yardRow(newId);
-  // 复制完成后按"服务重启后复核"的同一套流程处理新副本：
+  // 步骤 5：复制完成后按"服务重启后复核"的同一套流程处理新副本（幂等）：
   // 延时取消沿用原 release_at（不重新计时），到期者按副本自身状态核验；
   // 封锁复核与等待兑现均只作用于本副本。
-  const post = activateCopiedYard(newId);
-  dropYardConnection(newId); // 关闭刚复核用的连接，下次按正式路径重新打开
+  let post = { blockadesActivated: [], cancellationsReleased: [],
+               cancellationsAborted: [], waitingFulfilled: [] };
+  try {
+    post = activateCopiedYard(newId);
+  } catch (e) {
+    // 首次复核失败不影响副本完整性：调度器下轮与重启时会按同一幂等流程重试
+    console.error(`[yards] 副本 #${newId} 创建后首次复核失败（将由定时扫描重试）:`, e);
+  }
+  dropYardConnection(newId); // 关闭复核用连接，下次按正式路径重新打开
 
   return {
     yard: serializeYard(yard),
@@ -300,74 +339,117 @@ function createCopyInMainTxn(name, createdBy) {
   };
 }
 
+function duplicateName(name) {
+  const err = new Error(`已存在名为"${name}"的站场/副本，同名拒绝，请更换名称`);
+  err.status = 409;
+  err.code = 'YARD_NAME_DUPLICATE';
+  return err;
+}
+
+/** 复制失败回滚：删除 creating 注册行（释放同名）与意图行；编号不回收复用。 */
+function abortCreating(yardId) {
+  try {
+    getMainDb().transaction(() => {
+      getMainDb().prepare(`DELETE FROM yards WHERE id=? AND status='creating'`).run(yardId);
+      recovery.clearOp(yardId, 'create_copy');
+    })();
+  } catch (e) {
+    console.error(`[yards] 清理 creating 注册行 #${yardId} 失败:`, e);
+  }
+}
+
 /**
- * 在主库复制事务【内】执行全部 INSERT ... SELECT（调用方已在事务外
- * ATTACH 好 srcAlias/dstAlias 并开启事务）。返回复制明细。
- * 跨库事务任一语句失败由外层事务整体回滚，目标文件不会留下部分数据。
+ * 在临时业务库的复制事务【内】执行全部 INSERT ... SELECT。
+ * @param {Object} conn 临时库连接
+ * @param {string} srcAlias 源库（原站场）ATTACH 别名
+ * @param {string} dstAlias 目标库别名（临时库自身即 'main'）
+ * @param {{yardId:number,name:string,createdBy:string}} meta 新副本信息
  */
-function copyOriginalData(db, srcAlias, dstAlias) {
+function copyOriginalData(conn, srcAlias, dstAlias, meta) {
   // 1) 站场定义（整表）
   for (const t of DEFINITION_TABLES) {
-    db.exec(`INSERT INTO ${dstAlias}.${t} SELECT * FROM ${srcAlias}.${t}`);
+    conn.exec(`INSERT INTO ${dstAlias}.${t} SELECT * FROM ${srcAlias}.${t}`);
   }
 
   // 2) 仅开放中的进路实例 + 其锁与事件进度（released 历史不复制）
-  db.exec(`INSERT INTO ${dstAlias}.route_instances
+  conn.exec(`INSERT INTO ${dstAlias}.route_instances
            SELECT * FROM ${srcAlias}.route_instances WHERE status='open'`);
-  db.exec(`INSERT INTO ${dstAlias}.route_locks
+  conn.exec(`INSERT INTO ${dstAlias}.route_locks
            SELECT l.* FROM ${srcAlias}.route_locks l
              INNER JOIN ${srcAlias}.route_instances i ON i.id=l.instance_id
             WHERE i.status='open'`);
-  db.exec(`INSERT INTO ${dstAlias}.section_events
+  conn.exec(`INSERT INTO ${dstAlias}.section_events
            SELECT e.* FROM ${srcAlias}.section_events e
              INNER JOIN ${srcAlias}.route_instances i ON i.id=e.instance_id
             WHERE i.status='open'`);
 
   // 3) 未兑现等待申请（waiting；其 instance_id 恒为 NULL）
-  db.exec(`INSERT INTO ${dstAlias}.waiting_applications
+  conn.exec(`INSERT INTO ${dstAlias}.waiting_applications
            SELECT * FROM ${srcAlias}.waiting_applications WHERE status='waiting'`);
 
   // 4) 未完结延时取消（pending；release_at 原样，沿用原到期时刻）
-  db.exec(`INSERT INTO ${dstAlias}.cancellation_applications
+  conn.exec(`INSERT INTO ${dstAlias}.cancellation_applications
            SELECT * FROM ${srcAlias}.cancellation_applications WHERE status='pending'`);
 
   // 5) 未结束临时封锁（pending/active）
-  db.exec(`INSERT INTO ${dstAlias}.blockade_applications
+  conn.exec(`INSERT INTO ${dstAlias}.blockade_applications
            SELECT * FROM ${srcAlias}.blockade_applications
             WHERE status IN ('pending','active')`);
 
   // 6) 元数据（含 seeded_demo 标记、延时取消保护时长设置）
-  db.exec(`INSERT INTO ${dstAlias}.meta SELECT * FROM ${srcAlias}.meta`);
+  conn.exec(`INSERT INTO ${dstAlias}.meta SELECT * FROM ${srcAlias}.meta`);
 
-  // 7) 自增序列对齐到源库水位：DELETE+INSERT OR REPLACE 重写 sqlite_sequence
-  //    中的相关行（跨库事务内直接 INSERT 该内部表会被 SQLite 拒绝）。
-  db.prepare(`DELETE FROM ${dstAlias}.sqlite_sequence
+  // 7) 自增序列对齐到源库水位
+  conn.prepare(`DELETE FROM ${dstAlias}.sqlite_sequence
               WHERE name IN (${AUTOINCR_TABLES.map(() => '?').join(',')})`)
     .run(...AUTOINCR_TABLES);
-  const seqs = db.prepare(`SELECT name, seq FROM ${srcAlias}.sqlite_sequence`).all();
-  const upsertSeq = db.prepare(
+  const seqs = conn.prepare(`SELECT name, seq FROM ${srcAlias}.sqlite_sequence`).all();
+  const upsertSeq = conn.prepare(
     `INSERT OR REPLACE INTO ${dstAlias}.sqlite_sequence(name,seq) VALUES(?,?)`);
   for (const s of seqs) {
     if (AUTOINCR_TABLES.includes(s.name)) upsertSeq.run(s.name, s.seq);
   }
 
+  // 8) 复制行数统计（界标与清单共用）
   const count = (table, where = '', params = []) =>
-    db.prepare(`SELECT COUNT(*) AS n FROM ${dstAlias}.${table}${where ? ' ' + where : ''}`)
+    conn.prepare(`SELECT COUNT(*) AS n FROM ${dstAlias}.${table}${where ? ' ' + where : ''}`)
       .get(...params).n;
-  return {
-    copied: {
-      sections: count('sections'),
-      switches: count('switches'),
-      signals: count('signals'),
-      routes: count('routes'),
-      openInstances: count('route_instances'),
-      waiting: count('waiting_applications', `WHERE status='waiting'`),
-      pendingCancellations: count('cancellation_applications', `WHERE status='pending'`),
-      unfinishedBlockades: count('blockade_applications',
-        `WHERE status IN ('pending','active')`)
-    },
-    fromOriginal: true
+  const copied = {
+    sections: count('sections'),
+    switches: count('switches'),
+    signals: count('signals'),
+    routes: count('routes'),
+    openInstances: count('route_instances'),
+    waiting: count('waiting_applications', `WHERE status='waiting'`),
+    pendingCancellations: count('cancellation_applications', `WHERE status='pending'`),
+    unfinishedBlockades: count('blockade_applications',
+      `WHERE status IN ('pending','active')`)
   };
+
+  // 9) 副本创建界标：复制白名单不含 audit_entries，副本流水表为空，
+  //    本条成为副本审计流水 seq=1——之后只记录该副本自身的新变化，
+  //    不为复制来的旧数据补造历史。与复制数据同一单库事务，同成同败。
+  require('./audit').recordYardCreatedInTxn(conn, `${dstAlias}.audit_entries`, {
+    yardId: meta.yardId,
+    name: meta.name,
+    actor: meta.createdBy,
+    sourceYardId: ORIGINAL_YARD_ID,
+    copied
+  });
+
+  return { copied, fromOriginal: true };
+}
+
+/**
+ * 复制事务内写入副本创建清单（故障恢复据其判定副本是否复制完整）。
+ */
+function writeCopyManifest(conn, dstAlias, { yardId, name, createdBy, copied }) {
+  conn.prepare(
+    `INSERT INTO ${dstAlias}.yard_copy_manifest
+       (yard_id,source_yard_id,name,created_by,created_at,copied_json)
+     VALUES(?,?,?,?,?,?)`
+  ).run(yardId, ORIGINAL_YARD_ID, name, createdBy == null ? null : String(createdBy),
+    Date.now(), JSON.stringify(copied || {}));
 }
 
 /**
@@ -378,7 +460,6 @@ function copyOriginalData(db, srcAlias, dstAlias) {
  *    未到期的继续等待，由全局定时器按各站场分别扫描。
  */
 function activateCopiedYard(yardId) {
-  const { withYard } = require('./db');
   return withYard(yardId, () => {
     const blockade = require('./blockade');
     const waiting = require('./waiting');
@@ -414,10 +495,13 @@ function serializeYard(row) {
     sourceYardId: row.source_yard_id,
     status: row.status,
     paused: row.status === 'paused',
+    broken: row.status === 'broken',
     pausedBy: row.paused_by,
     pausedAt: row.paused_at,
     resumedBy: row.resumed_by,
     resumedAt: row.resumed_at,
+    brokenReason: row.broken_reason || null,
+    brokenAt: row.broken_at || null,
     createdBy: row.created_by,
     createdAt: row.created_at
   };
@@ -428,11 +512,14 @@ function getYard(yardId) {
 }
 
 /**
- * 校验并解析会话当前站场：编号非法/注册表缺失均拒绝（404）。
+ * 校验并解析会话当前站场：编号非法/注册表缺失/正在创建/已损坏均拒绝。
  * null/缺省视为原站场。
+ *  - 未知副本：404 YARD_NOT_FOUND；
+ *  - 创建中断尚未收敛的副本：404 YARD_NOT_READY（启动收敛通常已将其回滚）；
+ *  - 损坏隔离副本：503 YARD_BROKEN，并说明原因；其他站场照常使用。
  */
 function resolveSessionYard(yardIdRaw) {
-  if (yardIdRaw == null) return yardRow(ORIGINAL_YARD_ID);
+  if (yardIdRaw == null) return assertAccessible(yardRow(ORIGINAL_YARD_ID));
   const yardId = Number(yardIdRaw);
   if (!Number.isInteger(yardId) || yardId < 1) {
     const err = new Error('未知演练副本：该站场不存在');
@@ -440,11 +527,33 @@ function resolveSessionYard(yardIdRaw) {
     err.code = 'YARD_NOT_FOUND';
     throw err;
   }
-  const row = yardRow(yardId);
+  return assertAccessible(yardRow(yardId), yardId);
+}
+
+function assertAccessible(row, yardId) {
+  const id = row ? row.id : yardId;
   if (!row) {
-    const err = new Error(`未知演练副本 #${yardId}：该站场不存在`);
+    const err = new Error(`未知演练副本 #${id == null ? '' : id}：该站场不存在`);
     err.status = 404;
     err.code = 'YARD_NOT_FOUND';
+    throw err;
+  }
+  if (row.status === 'creating') {
+    const err = new Error(
+      `演练副本"${row.name}"（#${row.id}）尚在创建中（上次创建可能因进程中断未完成），` +
+      '请稍后重试或重新创建');
+    err.status = 404;
+    err.code = 'YARD_NOT_READY';
+    throw err;
+  }
+  if (row.status === 'broken') {
+    const err = new Error(
+      `演练副本"${row.name}"（#${row.id}）业务数据已损坏且无法自动修复，已被隔离、拒绝访问` +
+      (row.broken_reason ? `：${row.broken_reason}` : '') +
+      '；其他站场可正常使用，请联系管理员核查该副本业务库文件后重新创建副本');
+    err.status = 503;
+    err.code = 'YARD_BROKEN';
+    err.extra = { yardId: row.id, reason: row.broken_reason || null };
     throw err;
   }
   // paused 副本仍允许会话切换与只读查询；写操作由路由层统一拒绝。
