@@ -1,0 +1,26 @@
+services:
+  interlock:
+    build: .
+    container_name: route-interlocking-sim
+    ports:
+      - "3000:3000"
+    environment:
+      # 管理员默认口令 admin / admin123，请按需修改
+      ADMIN_PASSWORD: "admin123"
+      SEED_DEMO: "1"
+      PORT: "3000"
+      DB_PATH: "/data/interlock.db"
+    volumes:
+      # 主库（yards 注册表 + sessions）与各站场业务库目录
+      # （原站场 interlock.yards/yard-1.db 及各命名演练副本）一并持久化
+      - interlock-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/health', r => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  interlock-data:

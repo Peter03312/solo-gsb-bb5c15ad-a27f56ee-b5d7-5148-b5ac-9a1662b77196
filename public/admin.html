@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>管理员 · 进路联锁推演台</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>🛠 进路联锁推演台 · 管理台</h1>
+    <span class="spacer"></span>
+    <span id="yardBar" class="yard-bar"></span>
+    <span class="spacer"></span>
+    <span class="me" id="meName"></span>
+    <button id="refreshBtn">刷新</button>
+    <button id="logoutBtn">退出登录</button>
+  </header>
+
+  <div class="layout admin">
+    <div class="panel">
+      <div class="panel-head">
+        站场图编辑
+        <span class="muted" style="font-weight:400;font-size:12px;" id="editHint">
+          选择左侧工具后在图上点击绘制
+        </span>
+      </div>
+      <div class="panel-body" style="flex:1;padding:0;">
+        <svg id="yard" class="yard-svg" viewBox="0 0 1000 420" preserveAspectRatio="xMidYMid meet"></svg>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-body" id="side"></div>
+    </div>
+  </div>
+
+  <script src="common.js"></script>
+  <script src="admin.js"></script>
+</body>
+</html>

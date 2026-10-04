@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>值班员 · 进路联锁推演台</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>🚦 进路联锁推演台 · 值班台</h1>
+    <span class="spacer"></span>
+    <span id="yardBar" class="yard-bar"></span>
+    <span class="spacer"></span>
+    <span id="pollState" class="me"></span>
+    <span class="me" id="meName"></span>
+    <button id="refreshBtn">手动刷新</button>
+    <button id="logoutBtn">退出登录</button>
+  </header>
+
+  <div class="layout">
+    <div class="panel">
+      <div class="panel-head">
+        站场占用图
+        <span class="muted" style="font-weight:400;font-size:12px;">
+          实线灰=空闲　<span style="color:var(--red)">红=占用</span>　虚灰=未知(按占用)　紫=进路锁闭　点击区段可定位操作
+        </span>
+      </div>
+      <div class="panel-body" style="flex:1;padding:0;">
+        <svg id="yard" class="yard-svg" viewBox="0 0 1000 420" preserveAspectRatio="xMidYMid meet"></svg>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-body" id="side"></div>
+    </div>
+  </div>
+
+  <script src="common.js"></script>
+  <script src="dispatcher.js"></script>
+</body>
+</html>

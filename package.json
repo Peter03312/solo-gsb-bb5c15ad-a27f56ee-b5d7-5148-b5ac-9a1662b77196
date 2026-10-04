@@ -1,0 +1,31 @@
+{
+  "name": "route-interlocking-sim",
+  "version": "1.0.0",
+  "description": "小型铁路站场培训用 Web 进路联锁推演台",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "init-db": "node scripts/init-db.js",
+    "smoke": "node test/smoke.cjs",
+    "test:waiting": "node test/waiting-http.cjs",
+    "test:cancel": "node test/cancellation-http.cjs",
+    "test:blockade": "node test/blockade-http.cjs",
+    "test:handover": "node test/handover-http.cjs",
+    "test:yards": "node test/yards-http.cjs",
+    "test:plans": "node test/movement-plan-http.cjs",
+    "test:pause": "node test/pause-http.cjs",
+    "test:checkpoint": "node test/checkpoint-http.cjs",
+    "test:changeset": "node test/route-changeset-http.cjs",
+    "test:exam": "node test/exam-http.cjs",
+    "test:audit": "node test/audit-http.cjs",
+    "test": "npm run smoke && npm run test:waiting && npm run test:cancel && npm run test:blockade && npm run test:handover && npm run test:yards && npm run test:plans && npm run test:pause && npm run test:checkpoint && npm run test:changeset && npm run test:exam && npm run test:audit"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "express": "^4.19.2"
+  }
+}

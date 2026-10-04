@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>进路联锁推演台 · 登录</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="login-wrap">
+    <div class="login-card">
+      <h2>🚦 值班员登录</h2>
+      <p class="sub">输入姓名进入值班台，可多人同时登录，冲突由服务端仲裁</p>
+      <label for="dname">值班员姓名</label>
+      <input type="text" id="dname" placeholder="例如：张三 / 值班员A" maxlength="30">
+      <button class="primary" id="dlogin">进入值班台</button>
+    </div>
+    <div class="login-card">
+      <h2>🛠 管理员登录</h2>
+      <p class="sub">绘制区段/道岔/信号机，定义起终点进路，重置推演状态</p>
+      <label for="apass">管理员口令</label>
+      <input type="password" id="apass" placeholder="默认 admin123" maxlength="64">
+      <button class="primary" id="alogin">进入管理台</button>
+    </div>
+  </div>
+  <script src="common.js"></script>
+  <script>
+    async function login(kind) {
+      try {
+        let resp;
+        if (kind === 'dispatcher') {
+          const name = document.getElementById('dname').value.trim();
+          if (!name) return App.toast('请输入姓名', 'err');
+          resp = await App.api('/api/auth/login/dispatcher', {
+            method: 'POST', body: JSON.stringify({ name })
+          });
+        } else {
+          const password = document.getElementById('apass').value;
+          if (!password) return App.toast('请输入管理员口令', 'err');
+          resp = await App.api('/api/auth/login/admin', {
+            method: 'POST', body: JSON.stringify({ password })
+          });
+        }
+        App.setSession(resp);
+        location.href = kind === 'admin' ? '/admin.html' : '/dispatcher.html';
+      } catch (e) {
+        App.toast(e.message, 'err');
+      }
+    }
+    document.getElementById('dlogin').addEventListener('click', () => login('dispatcher'));
+    document.getElementById('alogin').addEventListener('click', () => login('admin'));
+    document.getElementById('dname').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') login('dispatcher');
+    });
+    document.getElementById('apass').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') login('admin');
+    });
+
+    // 已登录则直接跳转
+    if (App.token()) {
+      location.href = App.role() === 'admin' ? '/admin.html' : '/dispatcher.html';
+    }
+  </script>
+</body>
+</html>
